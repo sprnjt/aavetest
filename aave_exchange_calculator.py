@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import os
 from dotenv import load_dotenv
+from token_config import TOKENS, TokenConfig
 
 env_path = Path('.env')
 if not env_path.exists():
@@ -17,32 +18,30 @@ class AaveDataProvider:
     """Data provider for fetching on-chain data from Aave contracts"""
     
     def __init__(self, infura_api_key: str = None):
+        # Load environment and initialize Web3
         self.api_key = infura_api_key or os.getenv('INFURA_API_KEY')
         if not self.api_key:
-            raise ValueError("No Infura API key provided. Set INFURA_API_KEY environment variable or pass it to the constructor.")
+            raise ValueError("No Infura API key provided")
             
-        # Create RPC URL
         self.rpc_url = f"https://mainnet.infura.io/v3/{self.api_key}"
         
-        # Mainnet contract addresses
+        # Initialize addresses with lending pool
         self.addresses = {
-            'lending_pool': Web3.to_checksum_address('0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9'),
-            'usdc': Web3.to_checksum_address('0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'),
-            'ausdc': Web3.to_checksum_address('0xBcca60bB61934080951369a648Fb03DF4F96263C')
+            'lending_pool': Web3.to_checksum_address('0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9')
         }
+        # Add token addresses
+        for symbol, config in TOKENS.items():
+            self.addresses[symbol] = Web3.to_checksum_address(config.underlying_address)
+            self.addresses[f'a{symbol}'] = Web3.to_checksum_address(config.atoken_address)
         
-        self._normalized_income: Optional[int] = None
-        self._ray: Optional[int] = None
+        # Cache for normalized income values
+        self._normalized_incomes: Dict[str, Optional[int]] = {symbol: None for symbol in TOKENS}
         
         try:
-            # Initialize Web3 connection with retry mechanism
             self.w3 = self._initialize_web3(self.rpc_url)
-            
-            # Load ABIs and initialize contracts
             self.contracts = self._initialize_contracts()
-            
         except Exception as e:
-            raise Exception(f"Failed to initialize AaveDataProvider: {str(e)}")
+            raise Exception(f"Failed to initialize: {str(e)}")
 
     def _initialize_web3(self, rpc_url: str, max_retries: int = 3) -> Web3:
         """Initialize Web3 with retry mechanism"""
@@ -61,20 +60,23 @@ class AaveDataProvider:
         raise ConnectionError("Failed to connect to Ethereum node")
 
     def _initialize_contracts(self) -> Dict:
-        """Initialize contract instances"""
-        try:
-            return {
-                'lending_pool': self.w3.eth.contract(
-                    address=self.addresses['lending_pool'],
-                    abi=self._load_abi('lending_pool_abi.json')
-                ),
-                'ausdc': self.w3.eth.contract(
-                    address=self.addresses['ausdc'],
-                    abi=self._load_abi('atoken_abi.json')
-                )
-            }
-        except Exception as e:
-            raise Exception(f"Failed to initialize contracts: {str(e)}")
+        """Initialize contract instances for all tokens"""
+        contracts = {
+            'lending_pool': self.w3.eth.contract(
+                address=self.addresses['lending_pool'],
+                abi=self._load_abi('lending_pool_abi.json')
+            )
+        }
+        
+        # Initialize aToken contracts
+        atoken_abi = self._load_abi('atoken_abi.json')
+        for symbol, config in TOKENS.items():
+            contracts[f'a{symbol}'] = self.w3.eth.contract(
+                address=self.addresses[f'a{symbol}'],
+                abi=atoken_abi
+            )
+            
+        return contracts
 
     @staticmethod
     def _load_abi(filename: str) -> Dict:
@@ -89,81 +91,68 @@ class AaveDataProvider:
         except json.JSONDecodeError:
             raise ValueError(f"Invalid JSON in ABI file: {filename}")
 
-    def get_normalized_income(self) -> int:
-        """Get current normalized income for aUSDC with caching"""
-        if self._normalized_income is None:
-            try:
-                self._normalized_income = self.contracts['ausdc'].functions.getNormalizedIncome().call()
-            except Exception as e:
-                raise Exception(f"Failed to get normalized income: {str(e)}")
-        return self._normalized_income
+    def get_normalized_income(self, symbol: str) -> int:
+        """Get normalized income for specific token"""
+        if symbol not in TOKENS:
+            raise ValueError(f"Unsupported token: {symbol}")
+            
+        if self._normalized_incomes[symbol] is None:
+            contract = self.contracts[f'a{symbol}']
+            self._normalized_incomes[symbol] = contract.functions.getNormalizedIncome().call()
+            
+        return self._normalized_incomes[symbol]
 
-    def get_ray(self) -> int:
-        """Get RAY constant used in calculations with caching"""
-        if self._ray is None:
-            try:
-                self._ray = self.contracts['ausdc'].functions.RAY().call()
-            except Exception as e:
-                raise Exception(f"Failed to get RAY value: {str(e)}")
-        return self._ray
-
-    def refresh_data(self) -> None:
-        """Force refresh of cached data"""
-        self._normalized_income = None
-        self._ray = None
+    def refresh_data(self, symbol: str = None):
+        """Refresh cached data for one or all tokens"""
+        if symbol:
+            if symbol in self._normalized_incomes:
+                self._normalized_incomes[symbol] = None
+        else:
+            self._normalized_incomes = {symbol: None for symbol in TOKENS}
 
 
 class AaveCalculator:
-    """Calculator for USDC/aUSDC exchange rates"""
+    """Calculator for token/aToken exchange rates"""
     
-    RAY = Decimal('1e27') 
-    USDC_DECIMALS = Decimal('1e6')
+    RAY = Decimal('1e27')
     
     @classmethod
-    def calculate_ausdc_for_usdc(cls, usdc_amount: int, normalized_income: int) -> int:
-        """
-        Calculate how much aUSDC will be received for a given USDC amount
-        Args:
-            usdc_amount: Amount of USDC (in base units with 6 decimals)
-            normalized_income: Current normalized income from aToken contract
-        Returns:
-            Amount of aUSDC to be received
-        """
-        cls._validate_inputs(usdc_amount, normalized_income)
+    def calculate_atoken_for_token(cls, 
+                                 amount: int, 
+                                 normalized_income: int,
+                                 token_config: TokenConfig) -> int:
+        """Calculate aToken amount for given token amount"""
+        cls._validate_inputs(amount, normalized_income)
         
         try:
+            token_decimals = Decimal(f'1e{token_config.decimals}')
+            amount_decimal = Decimal(str(amount))
             normalized_income_decimal = Decimal(str(normalized_income))
-            usdc_decimal = Decimal(str(usdc_amount))
             
-            result = (usdc_decimal * cls.RAY * cls.RAY) / (cls.USDC_DECIMALS * normalized_income_decimal)
+            result = (amount_decimal * cls.RAY * cls.RAY) / (token_decimals * normalized_income_decimal)
             
             return int(result)
         except Exception as e:
-            raise Exception(f"Failed to calculate aUSDC amount: {str(e)}")
+            raise Exception(f"Failed to calculate aToken amount: {str(e)}")
 
     @classmethod
-    def calculate_usdc_for_ausdc(cls, ausdc_amount: int, normalized_income: int) -> int:
-        """
-        Calculate how much USDC will be received for a given aUSDC amount
-        Args:
-            ausdc_amount: Amount of aUSDC (in base units)
-            normalized_income: Current normalized income from aToken contract
-        Returns:
-            Amount of USDC to be received
-        """
-        cls._validate_inputs(ausdc_amount, normalized_income)
+    def calculate_token_for_atoken(cls,
+                                 atoken_amount: int,
+                                 normalized_income: int,
+                                 token_config: TokenConfig) -> int:
+        """Calculate token amount for given aToken amount"""
+        cls._validate_inputs(atoken_amount, normalized_income)
         
         try:
-   
+            token_decimals = Decimal(f'1e{token_config.decimals}')
+            atoken_decimal = Decimal(str(atoken_amount))
             normalized_income_decimal = Decimal(str(normalized_income))
-            ausdc_decimal = Decimal(str(ausdc_amount))
             
-            
-            result = (ausdc_decimal * normalized_income_decimal * cls.USDC_DECIMALS) / (cls.RAY * cls.RAY)
+            result = (atoken_decimal * normalized_income_decimal * token_decimals) / (cls.RAY * cls.RAY)
             
             return int(result)
         except Exception as e:
-            raise Exception(f"Failed to calculate USDC amount: {str(e)}")
+            raise Exception(f"Failed to calculate token amount: {str(e)}")
 
     @staticmethod
     def _validate_inputs(amount: int, normalized_income: int) -> None:
@@ -184,38 +173,45 @@ def format_amount(amount: int, decimals: int) -> str:
 
 if __name__ == "__main__":
     try:
-        # Create provider instance using environment variable
         data_provider = AaveDataProvider()
         
-        # Get current exchange rates from blockchain
-        normalized_income = data_provider.get_normalized_income()
+        # Test with different tokens
+        test_amounts = {
+            'USDC': 1000 * 10**6,    # 1000 USDC
+            'DAI': 1000 * 10**18,    # 1000 DAI
+            'WETH': 1 * 10**18,      # 1 WETH
+            'WBTC': 1 * 10**8,       # 1 WBTC
+            'USDT': 1000 * 10**6,    # 1000 USDT
+        }
         
-        # Test amounts
-        test_amounts = [int(amount * 10**6) for amount in [1, 100, 1000]]
-        
-        print("\nUSDC to aUSDC Exchange Rates:")
+        print("\nAave V2 Token Exchange Rates:")
         print("-" * 50)
         
-        for usdc_amount in test_amounts:
+        for symbol, amount in test_amounts.items():
             try:
+                token_config = TOKENS[symbol]
+                normalized_income = data_provider.get_normalized_income(symbol)
+                
                 # Calculate exchange amounts
-                ausdc_amount = AaveCalculator.calculate_ausdc_for_usdc(
-                    usdc_amount,
-                    normalized_income
+                atoken_amount = AaveCalculator.calculate_atoken_for_token(
+                    amount,
+                    normalized_income,
+                    token_config
                 )
                 
-                usdc_received = AaveCalculator.calculate_usdc_for_ausdc(
-                    ausdc_amount,
-                    normalized_income
+                token_received = AaveCalculator.calculate_token_for_atoken(
+                    atoken_amount,
+                    normalized_income,
+                    token_config
                 )
                 
                 # Print results
-                print(f"\nDeposit {format_amount(usdc_amount, 6)} USDC:")
-                print(f"Receive: {format_amount(ausdc_amount, 6)} aUSDC")
-                print(f"Withdrawable USDC: {format_amount(usdc_received, 6)} USDC")
+                print(f"\n{token_config.description} ({symbol}) Exchange:")
+                print(f"Deposit: {format_amount(amount, token_config.decimals)} {symbol}")
+                print(f"Receive: {format_amount(atoken_amount, token_config.decimals)} a{symbol}")
+                print(f"Withdrawable: {format_amount(token_received, token_config.decimals)} {symbol}")
                 
             except Exception as e:
-                print(f"Error calculating for amount {format_amount(usdc_amount, 6)} USDC: {str(e)}")
-            
+                print(f"Error processing {symbol}: {str(e)}")
     except Exception as e:
         print(f"Error: {str(e)}") 

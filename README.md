@@ -1,84 +1,62 @@
-# Aave USDC/aUSDC Exchange Calculator
+# Aave Token Exchange Calculator
 
-A Python tool to calculate exchange rates between USDC and aUSDC using Aave V2 protocol's smart contracts.
+Calculate exchange rates between tokens and their aTokens using Aave V2 protocol.
 
-## Overview
+## Supported Tokens
 
-Calculate exchange amounts for:
-- USDC → aUSDC (deposit)
-- aUSDC → USDC (withdrawal)
+Stablecoins:
+- USDC (USD Coin, 6 decimals)
+- USDT (Tether USD, 6 decimals)
+- DAI (Dai Stablecoin, 18 decimals)
+
+Wrapped Assets:
+- WETH (Wrapped Ether, 18 decimals)
+- WBTC (Wrapped Bitcoin, 8 decimals)
 
 ## Prerequisites
 
 - Python 3.7+
 - Infura account
 
-## Installation
+## Quick Start
 
-1. Clone and setup:
+1. Setup:
 ```bash
-# Clone repository
 git clone https://github.com/sprnjt/aavetest.git
 cd aavetest
-
-# Install dependencies
 pip install -r requirements.txt
-
-# Create abis directory
-mkdir abis
-
-# Setup environment
-cp .env.example .env
+cp .env.example .env  # Add your Infura API key
 ```
 
-2. Add ABI files to `abis/` directory:
-- `lending_pool_abi.json`
-- `atoken_abi.json`
-
-## Usage
-
+2. Usage:
 ```python
 from aave_exchange_calculator import AaveDataProvider, AaveCalculator
+from token_config import TOKENS
 
-# Initialize provider
 provider = AaveDataProvider()
+token_config = TOKENS['USDC']
+normalized_income = provider.get_normalized_income('USDC')
 
-# Get current rates
-normalized_income = provider.get_normalized_income()
-
-# Calculate exchange amounts
-usdc_amount = 1000 * 10**6  # 1000 USDC
-ausdc_amount = AaveCalculator.calculate_ausdc_for_usdc(usdc_amount, normalized_income)
+# Calculate aToken amount for 1000 USDC
+amount = 1000 * 10**token_config.decimals
+atoken_amount = AaveCalculator.calculate_atoken_for_token(
+    amount, 
+    normalized_income,
+    token_config
+)
 ```
-
-Run example:
-```bash
-python aave_exchange_calculator.py
-```
-
-## Contract Addresses
-
-Ethereum Mainnet:
-- Lending Pool: `0x7d2768dE32b0b80b7a3454c06BdAc94A69DDc7A9`
-- USDC: `0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48`
-- aUSDC: `0xBcca60bB61934080951369a648Fb03DF4F96263C`
 
 ## Project Structure
-
 ```
 aavetest/
-├── abis/
-│   ├── lending_pool_abi.json
-│   └── atoken_abi.json
-├── .env.example
-├── .gitignore
-├── requirements.txt
+├── abis/                    # Contract ABIs
 ├── aave_exchange_calculator.py
+├── token_config.py          # Token configurations
+├── requirements.txt         # Dependencies
 └── README.md
 ```
 
 ## Acknowledgments
-
 - [Aave Protocol](https://aave.com/)
 - [Web3.py](https://web3py.readthedocs.io/)
 - [Infura](https://infura.io/)
